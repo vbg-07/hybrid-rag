@@ -1,51 +1,59 @@
 # Hybrid RAG — High-Performance Local Retrieval-Augmented Generation
 
-A fully local RAG pipeline optimized for scientific document retrieval, benchmarked on the **SciFact BEIR** dataset (300 queries). Achieves **77.33% accuracy** with sub-120ms retrieval on consumer hardware — no GPU or cloud APIs required.
+A fully local RAG pipeline optimized for scientific document retrieval, benchmarked on the **SciFact BEIR** dataset (300 queries). Achieves **77% accuracy** with **35ms avg retrieval** on consumer hardware — no GPU or cloud APIs required.
 
 ## Performance
 
 | Metric | Value |
 |---|---|
-| Accuracy (Hit Rate) | **77.33%** (232/300 queries) |
-| Avg Retrieval Time | ~116ms (hybrid) / ~50ms (vector-only) |
+| Accuracy (Hit Rate) | **77.00%** (231/300 queries) |
+| Avg Retrieval Time | **35ms** |
 | Corpus | SciFact BEIR — 5,183 scientific abstracts |
 | Hardware | Intel i3 12th Gen · 8GB RAM · Zorin OS |
 
 ## Architecture
 
 ```
-┌──────────────┐     ┌──────────────────────────┐
-│  User Query  │────▶│  FastEmbed (ONNX, 2 threads) │
-└──────────────┘     │  BAAI/bge-small-en-v1.5  │
-                     └────────┬─────────────────┘
-                              │ embedding
-               ┌──────────────┴──────────────┐
-               ▼ (parallel via ThreadPool)   ▼
-      ┌────────────────┐          ┌─────────────────┐
-      │  BM25 Keyword  │          │  ChromaDB HNSW   │
-      │  (rank_bm25)   │          │  (inner product) │
-      │  weight: 0.3   │          │  weight: 0.7     │
-      └───────┬────────┘          └────────┬─────────┘
-              └──────────┬─────────────────┘
-                         ▼
-              ┌─────────────────────┐
-              │  Reciprocal Rank    │
-              │  Fusion (RRF)       │
-              └─────────┬───────────┘
-                        ▼
-              ┌─────────────────────┐
-              │  Qwen 2.5 1.5B     │
-              │  (Ollama, local)    │
-              └─────────────────────┘
+┌──────────────┐     ┌──────────────────────────────┐
+│  User Query  │────▶│  FastEmbed (ONNX, 2 threads)  │
+└──────────────┘     │  BAAI/bge-small-en-v1.5       │
+                     └────────────┬─────────────────┘
+                                  │ embedding
+                                  ▼
+                     ┌────────────────────────┐
+                     │  ChromaDB HNSW Search  │
+                     │  (inner product, k=30) │
+                     └────────────┬───────────┘
+                                  │ top-30 candidates
+                                  ▼
+                     ┌────────────────────────┐
+                     │  BM25 Rerank           │
+                     │  (rank_bm25, k=30)     │
+                     └────────────┬───────────┘
+                                  │ weighted fusion
+                                  ▼
+                     ┌────────────────────────┐
+                     │  Top-K Final Results   │
+                     └────────────┬───────────┘
+                                  ▼
+                     ┌────────────────────────┐
+                     │  Qwen 2.5 1.5B         │
+                     │  (Ollama, local)       │
+                     └────────────────────────┘
 ```
 
 ## Key Optimizations
 
-### 1. Hybrid Retrieval (BM25 + Vector)
-Pure vector search misses exact keywords like medical acronyms (e.g., "PGE2", "SSD"). We combine **ChromaDB** (semantic) with **BM25** (keyword) using weighted Reciprocal Rank Fusion at **0.3 / 0.7** weights.
+### 1. Vector-First Hybrid Retrieval
+Pure vector search misses exact keywords like medical acronyms (e.g., "PGE2", "SSD"). Instead of running BM25 across the entire 25k-chunk corpus (slow), we use a **two-stage approach**:
+1. **Stage 1**: ChromaDB HNSW retrieves top-30 candidates (~30ms)
+2. **Stage 2**: BM25 reranks only those 30 docs (<1ms)
+3. **Fusion**: Weighted combination (0.3 BM25 / 0.7 Vector) selects the final top-K
 
-### 2. Parallel Retrieval
-Replaced LangChain's sequential `EnsembleRetriever` with a custom `ParallelHybridRetriever` that runs BM25 and vector search concurrently via `ThreadPoolExecutor`.
+This `VectorFirstHybridRetriever` achieves the same accuracy as full hybrid search at **~35ms** instead of ~130ms.
+
+### 2. Why Not Parallel BM25?
+We tested running BM25 (25k chunks) and vector search in parallel via `ThreadPoolExecutor`. Python's GIL prevents true parallelism — both compete for the same CPU cores, yielding no speedup. The vector-first reranking approach is fundamentally faster.
 
 ### 3. Embedding Model — BGE-Small v1.5
 Upgraded from `all-MiniLM-L6-v2` to `BAAI/bge-small-en-v1.5` — a leaderboard champion specifically trained for RAG and scientific retrieval.
