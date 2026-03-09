@@ -3,76 +3,78 @@ import time
 import re
 from langchain_chroma import Chroma
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor
+from rank_bm25 import BM25Okapi
 
 CHROMA_PATH = "./chroma_db"
 QRELS_PATH = "./scifact/qrels/test.tsv"
 QUERIES_PATH = "./scifact/queries.jsonl"
 
-TOP_K = 5  # Reduced from 7 — still captures relevant docs, faster retrieval
+TOP_K = 5
+CANDIDATE_K = 30  # Vector retrieves this many, BM25 reranks them
 
 
-class ParallelHybridRetriever:
-    """Drop-in replacement for EnsembleRetriever with parallel execution."""
+def clean_text(text):
+    return re.sub(r'[.,]', ' ', text.lower()).split()
+
+
+class VectorFirstHybridRetriever:
+    """Vector search gets candidates, BM25 reranks only those — not all 25k chunks."""
     
-    def __init__(self, bm25_retriever, vector_retriever, weights=(0.3, 0.7), k=TOP_K):
-        self.bm25_retriever = bm25_retriever
+    def __init__(self, vector_retriever, weights=(0.3, 0.7), k=TOP_K, candidate_k=CANDIDATE_K):
         self.vector_retriever = vector_retriever
         self.bm25_weight = weights[0]
         self.vector_weight = weights[1]
         self.k = k
-        self._executor = ThreadPoolExecutor(max_workers=2)
+        self.candidate_k = candidate_k
     
     def invoke(self, query):
-        future_bm25 = self._executor.submit(self.bm25_retriever.invoke, query)
-        future_vector = self._executor.submit(self.vector_retriever.invoke, query)
+        # Step 1: Vector search gets top candidates (fast HNSW)
+        candidates = self.vector_retriever.invoke(query)
         
-        bm25_docs = future_bm25.result()
-        vector_docs = future_vector.result()
+        # Step 2: BM25 rerank ONLY these candidates (not 25k chunks)
+        tokenized_corpus = [clean_text(doc.page_content) for doc in candidates]
+        tokenized_query = clean_text(query)
+        bm25 = BM25Okapi(tokenized_corpus)
+        bm25_scores = bm25.get_scores(tokenized_query)
         
+        # Step 3: Weighted fusion of vector rank + BM25 score
         doc_scores = {}
         doc_map = {}
         
-        for rank, doc in enumerate(bm25_docs):
+        for rank, doc in enumerate(candidates):
             key = doc.page_content[:100]
             doc_map[key] = doc
-            doc_scores[key] = doc_scores.get(key, 0.0) + self.bm25_weight / (rank + 60)
+            # Vector rank score
+            doc_scores[key] = self.vector_weight / (rank + 60)
         
-        for rank, doc in enumerate(vector_docs):
+        # Normalize BM25 scores and add
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+        for i, doc in enumerate(candidates):
             key = doc.page_content[:100]
-            doc_map[key] = doc
-            doc_scores[key] = doc_scores.get(key, 0.0) + self.vector_weight / (rank + 60)
+            normalized_bm25 = bm25_scores[i] / max_bm25
+            doc_scores[key] += self.bm25_weight * normalized_bm25 / 60
         
         sorted_keys = sorted(doc_scores, key=doc_scores.get, reverse=True)
         return [doc_map[k] for k in sorted_keys[:self.k]]
 
 
 def setup_retriever():
-    print("Loading Vector Store and building BM25 Index...")
+    print("Loading Vector Store...")
     embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5", threads=2)
     vectorstore = Chroma(
         persist_directory=CHROMA_PATH,
         embedding_function=embeddings,
-        collection_metadata={"hnsw:space": "ip"}  # inner product for normalized BGE embeddings
+        collection_metadata={"hnsw:space": "ip"}
     )
     
-    db_data = vectorstore.get()
-    docs = [Document(page_content=txt, metadata=meta) for txt, meta in zip(db_data['documents'], db_data['metadatas'])]
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": CANDIDATE_K})
 
-    def clean_text(text):
-        return re.sub(r'[.,]', ' ', text.lower()).split()
-
-    bm25_retriever = BM25Retriever.from_documents(docs, preprocess_func=clean_text)
-    bm25_retriever.k = TOP_K
-    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
-
-    return ParallelHybridRetriever(
-        bm25_retriever=bm25_retriever,
+    return VectorFirstHybridRetriever(
         vector_retriever=vector_retriever,
         weights=(0.3, 0.7),
-        k=TOP_K
+        k=TOP_K,
+        candidate_k=CANDIDATE_K
     )
 
 
