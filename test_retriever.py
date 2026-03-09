@@ -117,10 +117,10 @@ if __name__ == "__main__":
             
         start_time = time.time()
         
-        # We invoke the retriever directly, skipping the LLM entirely
+       
         results = retriever.invoke(query)
         
-        # De-duplicate just like we do in query.py
+        
         seen = set()
         unique_results = []
         for chunk in results:
@@ -138,17 +138,17 @@ if __name__ == "__main__":
         for i, doc in enumerate(results):
             print(f"\n--- CHUNK {i+1} ---")
             
-            # Format the metadata to show off your new Markdown headers!
+           
             meta = doc.metadata
             source = os.path.basename(meta.get("source", "Unknown Source"))
             print(f"📁 Source: {source}")
             
-            # Extract and print any Markdown headers if the splitter caught them
+           
             headers = [f"{k}: {v}" for k, v in meta.items() if k.startswith("Header")]
             if headers:
                 print(f"🏷️  Headers: {' | '.join(headers)}")
                 
-            # Print the content preview cleanly
+           
             preview = doc.page_content.replace('\n', ' ')
             if len(preview) > 300:
                 preview = preview[:300] + "..."

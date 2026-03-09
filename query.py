@@ -109,6 +109,14 @@ def ask(query, retriever, llm):
     )
 
     print(f"\n⏱️ Retrieval: {retrieval_time:.0f}ms | Docs: {len(docs)}")
+
+    print("\n📎 Top 3 Retrieved Chunks:")
+    for i, doc in enumerate(docs[:3]):
+        source = doc.metadata.get('source', 'Unknown')
+        snippet = doc.page_content[:200].replace("\n", " ")
+        print(f"  [{i+1}] ({source})")
+        print(f"      {snippet}...")
+
     print(f"\n🤖 Answer: ", end="", flush=True)
 
     llm_start = time.time()
